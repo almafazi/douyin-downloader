@@ -215,28 +215,98 @@ def _build_video_response(
     )
 
 
+def _iter_gallery_items(aweme_data: Dict[str, Any]) -> List[Any]:
+    image_post = aweme_data.get("image_post_info")
+    if isinstance(image_post, dict):
+        for key in ("images", "image_list"):
+            candidate = image_post.get(key)
+            if isinstance(candidate, list) and candidate:
+                return candidate
+    images = aweme_data.get("images") or aweme_data.get("image_list") or []
+    if isinstance(images, list):
+        return images
+    return []
+
+
+def _collect_photo_candidates(img: Dict[str, Any]) -> List[str]:
+    sources = [
+        img.get("watermark_free_download_url_list"),
+        img,
+        img.get("origin_image"),
+        img.get("display_image"),
+        img.get("download_url"),
+        img.get("download_addr"),
+        img.get("download_url_list"),
+        img.get("owner_watermark_image"),
+    ]
+    
+    def extract_urls(source: Any) -> List[str]:
+        if isinstance(source, dict):
+            url_list = source.get("url_list") or source.get("urlList")
+            if isinstance(url_list, list) and url_list:
+                return [item for item in url_list if isinstance(item, str) and item]
+        elif isinstance(source, list) and source:
+            return [item for item in source if isinstance(item, str) and item]
+        elif isinstance(source, str) and source:
+            return [source]
+        return []
+
+    def is_watermarked(url: str) -> bool:
+        normalized = url.lower()
+        watermark_hints = (
+            "tplv-dy-water",
+            "dy-water",
+            "owner_watermark",
+            "watermark_image",
+            "watermark=1",
+            "playwm",
+        )
+        return any(hint in normalized for hint in watermark_hints)
+
+    def media_url_priority(url: str) -> int:
+        normalized = url.lower()
+        from urllib.parse import urlparse
+        path = (urlparse(url).path or "").lower()
+        score = 100 if is_watermarked(normalized) else 0
+        return score + (1 if ".webp" in path else 0)
+
+    urls: List[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for candidate in sorted(
+            extract_urls(source),
+            key=media_url_priority,
+        ):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            urls.append(candidate)
+    return urls
+
+
 def _build_gallery_response(
     aweme_data: Dict[str, Any], session_key: str, author_dict: Dict[str, Any],
     nickname: str, desc: str, statistics: Dict[str, Any], cover_url: str,
     download_links: Dict[str, Any], video_duration: int, avatar_url: str,
     mp3_url: Optional[str] = None,
 ) -> TikTokResponse:
-    images = aweme_data.get("images") or []
+    images = _iter_gallery_items(aweme_data)
     photos = []
     image_keys: list = []
 
     for i, img in enumerate(images):
         if not isinstance(img, dict):
             continue
-        img_url_list = img.get("url_list") or img.get("download_url_list") or []
+        img_url_list = _collect_photo_candidates(img)
         if not img_url_list:
             continue
-        img_url = img_url_list[0] if isinstance(img_url_list[0], str) else str(img_url_list[0])
+        img_url = img_url_list[0]
 
         img_key = f"{session_key}_photo_{i}"
         img_data = {
             "aweme_id": aweme_data.get("aweme_id", ""),
             "direct_url": img_url,
+            "direct_url_candidates": img_url_list,
             "media_type": "image/jpeg",
             "session_type": "photo",
             "desc": desc,
@@ -429,57 +499,49 @@ async def _deliver_direct(
     request: Request,
     session: Dict[str, Any],
 ) -> StreamingResponse:
-    """Stream media directly from upstream URL with Range support and 403 refresh."""
-    current_url = plan.direct_url
-    current_headers = dict(plan.request_headers)
+    """Stream media directly from upstream URL with Range support, fallback URLs, and 403 refresh."""
+    candidates = session.get("direct_url_candidates") or []
+    if not candidates and plan.direct_url:
+        candidates = [plan.direct_url]
+
+    if not candidates:
+        raise HTTPException(status_code=400, detail="No media URL found")
 
     range_header = request.headers.get("Range")
     if_range = request.headers.get("If-Range")
 
-    if range_header and not if_range:
-        current_headers["Range"] = range_header
+    last_error_status = 502
+    last_error_body = b""
 
-    max_attempts = 2 if plan.can_refresh else 1
+    # Attempt to download from each candidate URL sequentially
+    for candidate_url in candidates:
+        current_headers = dict(plan.request_headers)
+        if range_header and not if_range:
+            current_headers["Range"] = range_header
 
-    for attempt in range(max_attempts):
         timeout = aiohttp.ClientTimeout(total=300)
         session_client = aiohttp.ClientSession(timeout=timeout)
 
         try:
             resp = await session_client.get(
-                current_url,
+                candidate_url,
                 headers=current_headers,
                 allow_redirects=True,
             )
-            if resp.status == 403 and attempt == 0 and plan.can_refresh:
-                body = await resp.read()
-                resp.close()
-                await session_client.close()
-
-                if _should_refresh_on_403(body, plan.platform):
-                    logger.info("Got 403, attempting to refresh URL...")
-                    new_url = await _refresh_url(session)
-                    if new_url:
-                        logger.info("URL refreshed successfully")
-                        current_url = new_url
-                        continue
-
-                return StreamingResponse(
-                    iter([body]),
-                    media_type=plan.media_type,
-                    status_code=403,
-                )
-
+            # If the candidate returns a client/server error, try next candidate
             if resp.status >= 400:
-                body = await resp.read()
+                last_error_status = resp.status
+                last_error_body = await resp.read()
                 resp.close()
                 await session_client.close()
-                return StreamingResponse(
-                    iter([body]),
-                    media_type=plan.media_type,
-                    status_code=resp.status,
+                logger.warning(
+                    "Candidate URL failed with status %d, trying next fallback: %s",
+                    resp.status,
+                    candidate_url[:100],
                 )
+                continue
 
+            # Successful connection (200 or 206)
             async def content_generator():
                 try:
                     async for chunk in resp.content.iter_chunked(BUFFER_SIZE):
@@ -488,21 +550,61 @@ async def _deliver_direct(
                     resp.close()
                     await session_client.close()
 
+            # Dynamically use Content-Type from CDN response if available
+            response_content_type = resp.headers.get("Content-Type", plan.media_type)
             return StreamingResponse(
                 content_generator(),
-                media_type=plan.media_type,
+                media_type=response_content_type,
                 headers={k: v for k, v in plan.response_headers.items()},
+                status_code=resp.status,
             )
         except Exception as e:
-            logger.error("Stream error: %s", e)
+            logger.error("Stream error for candidate %s: %s", candidate_url[:100], e)
             await session_client.close()
-            if attempt < max_attempts - 1:
-                continue
-            return StreamingResponse(
-                iter([f"Stream error: {e}".encode()]),
-                media_type="text/plain",
-                status_code=502,
-            )
+            last_error_status = 502
+            last_error_body = str(e).encode()
+            continue
+
+    # If all candidates failed and refresh is supported (usually for videos), try to refresh URL
+    if plan.can_refresh:
+        logger.info("All candidates failed, attempting to refresh URL...")
+        new_url = await _refresh_url(session)
+        if new_url:
+            logger.info("URL refreshed successfully: %s", new_url[:100])
+            session_client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300))
+            try:
+                current_headers = dict(plan.request_headers)
+                if range_header and not if_range:
+                    current_headers["Range"] = range_header
+                resp = await session_client.get(new_url, headers=current_headers, allow_redirects=True)
+                if resp.status < 400:
+                    async def content_generator():
+                        try:
+                            async for chunk in resp.content.iter_chunked(BUFFER_SIZE):
+                                yield chunk
+                        finally:
+                            resp.close()
+                            await session_client.close()
+                    return StreamingResponse(
+                        content_generator(),
+                        media_type=plan.media_type,
+                        headers={k: v for k, v in plan.response_headers.items()},
+                        status_code=resp.status,
+                    )
+                else:
+                    last_error_status = resp.status
+                    last_error_body = await resp.read()
+                    resp.close()
+                    await session_client.close()
+            except Exception as e:
+                logger.error("Stream error after refresh: %s", e)
+                await session_client.close()
+
+    return StreamingResponse(
+        iter([last_error_body]),
+        media_type=plan.media_type if last_error_status != 502 else "text/plain",
+        status_code=last_error_status,
+    )
 
     raise HTTPException(status_code=502, detail="Stream failed after refresh")
 
