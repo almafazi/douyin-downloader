@@ -1,0 +1,21 @@
+services:
+  tiktok-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.tiktok
+    container_name: douyin-tiktok-api
+    ports:
+      - "8089:8089"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8089
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - ./.cookies.json:/app/.cookies.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8089/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

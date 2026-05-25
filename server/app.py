@@ -149,6 +149,9 @@ def build_app(config: ConfigLoader) -> FastAPI:
     app.state.job_manager = manager
     app.state.deps = deps
 
+    from server.tiktok_api import register_tiktok_routes
+    register_tiktok_routes(app)
+
     @app.get("/api/v1/health")
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
