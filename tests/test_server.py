@@ -173,3 +173,34 @@ async def test_job_manager_prunes_by_ttl():
     remaining_ids = {j.job_id for j in await manager.list_jobs()}
     assert old_job.job_id not in remaining_ids
     assert new_job.job_id in remaining_ids
+
+
+def test_tiktok_delivery_plan_photo_extension():
+    from server.tiktok_api import _build_delivery_plan
+
+    # Test JPG photo
+    session_jpg = {
+        "direct_url": "https://example.com/images/123.jpg?query=1",
+        "media_type": "image/jpeg",
+        "session_type": "photo",
+    }
+    plan_jpg = _build_delivery_plan(session_jpg, "test_key")
+    assert "test_key.jpg" in plan_jpg.response_headers["Content-Disposition"]
+
+    # Test WebP photo
+    session_webp = {
+        "direct_url": "https://example.com/images/123.webp",
+        "media_type": "image/webp",
+        "session_type": "photo",
+    }
+    plan_webp = _build_delivery_plan(session_webp, "test_key")
+    assert "test_key.webp" in plan_webp.response_headers["Content-Disposition"]
+
+    # Test unknown extension fallback
+    session_fallback = {
+        "direct_url": "https://example.com/images/123",
+        "media_type": "image/jpeg",
+        "session_type": "photo",
+    }
+    plan_fallback = _build_delivery_plan(session_fallback, "test_key")
+    assert "test_key.jpg" in plan_fallback.response_headers["Content-Disposition"]

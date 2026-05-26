@@ -403,6 +403,21 @@ def _build_delivery_plan(session: Dict[str, Any], key: str) -> DeliveryPlan:
         ext = "mp3"
     elif content_type == "slideshow":
         ext = "mp4"
+    elif session_type == "photo" or content_type == "photo":
+        from urllib.parse import urlparse
+        from pathlib import Path
+        import re
+
+        path = (urlparse(direct_url).path or "").lower()
+        suffix = Path(path).suffix.lower()
+        if suffix in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            ext = suffix[1:]
+        else:
+            matches = re.findall(r"\.(jpg|jpeg|png|webp|gif)(?=[^a-z0-9]|$)", path)
+            if matches:
+                ext = matches[-1].lower()
+            else:
+                ext = "jpg"
     else:
         ext = "mp4"
 
