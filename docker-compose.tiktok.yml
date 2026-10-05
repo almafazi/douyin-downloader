@@ -16,9 +16,22 @@ services:
       # and a restart would fall back to the stale file.
       - ./.cookies.json:/app/.cookies.json
     restart: unless-stopped
+    networks:
+      - douyin-ipv6
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8089/api/v1/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
+
+networks:
+  # Douyin answers this server over IPv6 and refuses it over IPv4: the same
+  # signed request, same moment, returns 200 via 2404:2280:18c::/48 and 403 via
+  # 163.181.254.188. The host prefers IPv6 and has always worked; containers are
+  # IPv4-only by default, which is why every request from here had been a 403
+  # since 15 September -- read as "Video not found" by the client, and mistaken
+  # for a signature, cookie or TLS problem. None of those: the extractor was
+  # fine, it just had no route Douyin would answer on.
+  douyin-ipv6:
+    enable_ipv6: true
