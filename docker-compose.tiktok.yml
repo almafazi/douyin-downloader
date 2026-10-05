@@ -11,7 +11,10 @@ services:
       - SERVER_PORT=8089
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - ./.cookies.json:/app/.cookies.json:ro
+      # Writable: config.yml sets auto_cookie, so CookieManager has to persist
+      # refreshed cookies here. Mounted :ro the save failed on every request
+      # and a restart would fall back to the stale file.
+      - ./.cookies.json:/app/.cookies.json
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://localhost:8089/api/v1/health')"]
